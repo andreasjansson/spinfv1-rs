@@ -162,6 +162,12 @@ impl StreamResampler {
     }
 }
 
+/// The FV-1's clock in the FX AID XL. The module's MCU makes it with a timer (72 MHz / period),
+/// so it depends on the SRR jack's CV mode. In CV modes 0-2 and 4 it is fixed: 72 MHz / 2197 =
+/// 32,772 Hz requested, 32,774 Hz measured (2026-10-09). In mode 3 ("SRR") the jack sets it,
+/// 48 kHz to 2 kHz, and an unpatched jack floats (32,672-32,939 Hz measured).
+pub const XL_CHIP_RATE: f64 = 32_774.0;
+
 /// An [`Fv1`] running at the authentic chip rate behind a host-rate
 /// stream: feed one frame per host sample, get one frame back, and the
 /// program's delays, LFOs and filters behave exactly as on hardware.

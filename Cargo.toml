@@ -33,6 +33,8 @@ ffi = ["std", "resampler"]
 # build with `--no-default-features --features libm`. The math is the
 # same deterministic pure-arithmetic code as under `std`.
 libm = []
+# Diagnostic: count accumulator saturations per instruction (fixed::satcount).
+satcount = []
 
 [dependencies]
 

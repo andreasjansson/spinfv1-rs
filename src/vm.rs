@@ -64,7 +64,33 @@ pub struct Fv1 {
     adc_noise: bool,
     noise_seed: u32,
     noise_state: u32,
+    lfo_reads_zero: bool,
+    model: ChipModel,
+    /// One-pole smoothing of the pots, per sample (0 = none). See `set_pot_smoothing`.
+    pot_k: f64,
+    pot_state: [f64; 3],
+    pot_set: [bool; 3],
 }
+
+/// Which chip behaviour the arithmetic models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipModel {
+    /// spinfv1's model (the default): MULX at full precision, LOG/EXP rounded at full
+    /// precision, and a 3-bit-exponent delay-RAM word. The golden vectors and the
+    /// independent-VM captures in `tests/` pin this model.
+    Reference,
+    /// The FV-1 as measured bit for bit on a Happy Nerding FX AID XL (2026-10-09, by probe
+    /// programs recorded through the module's codec): MULX truncates its register operand to
+    /// 14 fractional bits, LOG returns log2 on a 2^-12 grid, EXP keeps about 12 significant
+    /// bits, both rounded down, and delay RAM stores a 4-bit-exponent, 9-bit-fraction word,
+    /// rounded towards minus infinity. See [`Fv1::fx_aid_xl`].
+    FxAidXl,
+}
+
+/// The FX AID XL's pots (knob + CV) settle with a first-order lag of about 123 ms (measured
+/// 2026-10-09: a CV step gives t10 = 12.9 ms, t90 = 283 ms, ratio 21.9 as for one pole).
+/// Per-sample coefficient at the chip rate measured then (32,690 Hz).
+pub const XL_POT_SMOOTHING: f64 = 1.0 / (0.123 * 32_690.0);
 
 impl Fv1 {
     /// A fresh FV-1 with an all-NOP program (outputs silence).
@@ -88,6 +114,11 @@ impl Fv1 {
             adc_noise: false,
             noise_seed: 1,
             noise_state: 1,
+            lfo_reads_zero: false,
+            model: ChipModel::Reference,
+            pot_k: 0.0,
+            pot_state: [0.0; 3],
+            pot_set: [false; 3],
         }
     }
 
@@ -101,6 +132,55 @@ impl Fv1 {
             self.delay.fill(0);
         }
         self.reset_registers_and_lfos();
+    }
+
+    /// An FV-1 as it behaves in a Happy Nerding FX AID XL: [`ChipModel::FxAidXl`] arithmetic,
+    /// LFO-rate/range, DACL/DACR and ADDR_PTR registers that read back as 0
+    /// ([`Self::set_lfo_reads_zero`]), and the module's pot lag ([`XL_POT_SMOOTHING`]).
+    /// Its chip runs at `resampler::XL_CHIP_RATE` (with the `resampler` feature:
+    /// `HostedFv1::with_chip_rate(chip, host_rate, XL_CHIP_RATE)`).
+    #[must_use]
+    pub fn fx_aid_xl() -> Self {
+        let mut fv1 = Self::new();
+        fv1.set_model(ChipModel::FxAidXl);
+        fv1.set_lfo_reads_zero(true);
+        fv1.set_pot_smoothing(XL_POT_SMOOTHING);
+        fv1
+    }
+
+    /// Choose the arithmetic model ([`ChipModel::Reference`] by default).
+    pub fn set_model(&mut self, model: ChipModel) {
+        self.model = model;
+    }
+
+    /// The arithmetic model in use.
+    #[must_use]
+    pub fn model(&self) -> ChipModel {
+        self.model
+    }
+
+    /// Switch programs the way a slot change on the FX AID XL does (measured 2026-10-09):
+    /// REG0-31 and the delay RAM start at 0, the `skp run` block runs again, and the LFOs keep
+    /// running with the previous program's settings.
+    pub fn switch_program_keep_state(&mut self, program: &Program) {
+        self.instructions = program.instructions();
+        self.first_run = true;
+        for r in &mut self.regs[0x20..0x40] {
+            *r = 0;
+        }
+        for v in self.delay.iter_mut() {
+            *v = 0;
+        }
+    }
+
+    /// Fill REG0..=REG31 with full-scale pseudo-random values: a harsh
+    /// stand-in for whatever a previous program left in them.
+    pub fn scramble_registers(&mut self, seed: u32) {
+        let mut state = seed | 1;
+        for reg in &mut self.regs[0x20..0x40] {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *reg = (state as i32) >> 8;
+        }
     }
 
     /// Whether a program load also clears delay RAM (the default). Disable
@@ -184,7 +264,19 @@ impl Fv1 {
     pub fn set_pot(&mut self, idx: usize, value: f32) {
         if let Some(pot) = self.pots.get_mut(idx) {
             *pot = f32_to_s23(value.clamp(0.0, 1.0));
+            if !self.pot_set[idx] {
+                // the first setting is where the knob already is: no glide at load
+                self.pot_state[idx] = f64::from(*pot);
+                self.pot_set[idx] = true;
+            }
         }
+    }
+
+    /// Per-sample one-pole coefficient for the pot lag. 0, the default, turns it off: the POT
+    /// registers follow `set_pot` at once. [`Self::fx_aid_xl`] sets [`XL_POT_SMOOTHING`], the
+    /// module's measured lag.
+    pub fn set_pot_smoothing(&mut self, k: f64) {
+        self.pot_k = k.clamp(0.0, 1.0);
     }
 
     /// The real chip stores samples in 14-bit delay RAM using "a compressed
@@ -206,6 +298,26 @@ impl Fv1 {
         self.acc
     }
 
+    /// Make instruction reads of the LFO rate/range registers (addresses 0..=7), DACL/DACR
+    /// and ADDR_PTR return 0, whatever was written, as on the FX AID XL (off by default;
+    /// [`Self::fx_aid_xl`] turns it on). On the module every program that read RMPx_RATE
+    /// back as a constant was silent, exactly as with zero readback, and probe programs
+    /// confirmed it bit for bit for all of these registers.
+    pub fn set_lfo_reads_zero(&mut self, enabled: bool) {
+        self.lfo_reads_zero = enabled;
+    }
+
+    /// Register read as an instruction sees it (see [`Self::set_lfo_reads_zero`]).
+    fn read_reg(&self, reg: u8) -> i32 {
+        let r = reg & 0x3F;
+        if self.lfo_reads_zero && (r < 8 || r == reg::DACL || r == reg::DACR || r == reg::ADDR_PTR)
+        {
+            0
+        } else {
+            self.regs[usize::from(r)]
+        }
+    }
+
     /// Raw S.23 value of register `r` (6-bit address).
     #[must_use]
     pub fn register(&self, r: u8) -> i32 {
@@ -220,6 +332,8 @@ impl Fv1 {
 
     /// Process one stereo sample (floats in `[-1.0, 1.0)`).
     pub fn process(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        #[cfg(feature = "satcount")]
+        crate::fixed::satcount::set_pc(128);
         let (l, r) = self.process_raw(f32_to_s23(in_l), f32_to_s23(in_r));
         (s23_to_f32(l), s23_to_f32(r))
     }
@@ -260,15 +374,25 @@ impl Fv1 {
         } else {
             (in_l, in_r)
         };
+        #[cfg(feature = "satcount")]
+        crate::fixed::satcount::set_pc(128);
         self.regs[usize::from(reg::ADCL)] = sat24(i64::from(in_l));
         self.regs[usize::from(reg::ADCR)] = sat24(i64::from(in_r));
-        self.regs[usize::from(reg::POT0)] = self.pots[0];
-        self.regs[usize::from(reg::POT1)] = self.pots[1];
-        self.regs[usize::from(reg::POT2)] = self.pots[2];
+        for i in 0..3 {
+            let target = f64::from(self.pots[i]);
+            if self.pot_k > 0.0 && self.pot_set[i] {
+                self.pot_state[i] += (target - self.pot_state[i]) * self.pot_k;
+            } else {
+                self.pot_state[i] = target;
+            }
+            self.regs[usize::from(reg::POT0) + i] = self.pot_state[i] as i32;
+        }
 
         let mut ic = 0usize;
         while ic < PROGRAM_LEN {
             let ins = self.instructions[ic];
+            #[cfg(feature = "satcount")]
+            crate::fixed::satcount::set_pc(ic);
             ic += 1;
             let acc = i64::from(self.acc);
             match ins {
@@ -290,11 +414,11 @@ impl Fv1 {
                     self.acc = sat24(mul_s1_9(acc, i64::from(c)) + i64::from(self.lr));
                 }
                 Instruction::Rdax { reg, c } => {
-                    let r = i64::from(self.regs[usize::from(reg & 0x3F)]);
+                    let r = i64::from(self.read_reg(reg));
                     self.acc = sat24(mul_s1_14(r, i64::from(c)) + acc);
                 }
                 Instruction::Rdfx { reg, c } => {
-                    let r = i64::from(self.regs[usize::from(reg & 0x3F)]);
+                    let r = i64::from(self.read_reg(reg));
                     self.acc = sat24(mul_s1_14(acc - r, i64::from(c)) + r);
                 }
                 Instruction::Wrax { reg, c } => {
@@ -311,31 +435,58 @@ impl Fv1 {
                     self.acc = sat24(mul_s1_14(pacc - acc, i64::from(c)) + pacc);
                 }
                 Instruction::Maxx { reg, c } => {
-                    let r = i64::from(self.regs[usize::from(reg & 0x3F)]);
+                    let r = i64::from(self.read_reg(reg));
                     let rxc = mul_s1_14(r, i64::from(c)).abs();
                     self.acc = sat24(rxc.max(acc.abs()));
                 }
                 Instruction::Mulx { reg } => {
-                    let r = i64::from(self.regs[usize::from(reg & 0x3F)]);
+                    // FxAidXl: the chip multiplies ACC by the register truncated to 14
+                    // fractional bits (its low 9 bits dropped, as a coefficient would be),
+                    // product floored: bit-exact on 240/240 measured frames. Full precision
+                    // was off by up to ~2^-14 relative.
+                    let r = self.read_reg(reg);
+                    let r = i64::from(if self.model == ChipModel::FxAidXl {
+                        r >> 9 << 9
+                    } else {
+                        r
+                    });
                     self.acc = sat24(mul_s23(acc, r));
                 }
                 Instruction::Log { c, d } => {
-                    // ACC is treated as S4.19 in the log domain.
+                    // ACC is treated as S4.19 in the log domain. FxAidXl: the chip returns
+                    // log2 on a grid of 2^-12 (low 7 bits of the S4.19 result zero); floor to
+                    // that grid is the closest simple model (errors stay within ~3 grid steps,
+                    // ~1 cent; the exact curve is not known).
                     let l = if self.acc == 0 {
                         i64::from(ACC_MIN)
                     } else {
                         let mag = f64::from(self.acc.unsigned_abs()) / f64::from(ONE_S23);
-                        sat24(math::round(math::log2(mag) * f64::from(1 << 19)) as i64).into()
+                        if self.model == ChipModel::FxAidXl {
+                            let q = math::floor(math::log2(mag) * f64::from(1 << 12)) as i64;
+                            sat24(q << 7).into()
+                        } else {
+                            sat24(math::round(math::log2(mag) * f64::from(1 << 19)) as i64).into()
+                        }
                     };
                     self.acc = sat24(mul_s1_14(l, i64::from(c)) + (i64::from(d) << 13));
                 }
                 Instruction::Exp { c, d } => {
-                    // ACC (S4.19) exponentiated; 2^x >= 1.0 saturates.
+                    // ACC (S4.19) exponentiated; 2^x >= 1.0 saturates. FxAidXl: the chip keeps
+                    // ~12 significant bits of the result, rounded down (124/240 measured frames
+                    // bit-exact with this model, rms error 2.4e-4 vs 1.1e-3 for full precision;
+                    // the exact curve is not known).
                     let e = if self.acc >= 0 {
                         i64::from(ACC_MAX)
                     } else {
                         let x = f64::from(self.acc) / f64::from(1 << 19);
-                        math::round(math::exp2(x) * f64::from(ONE_S23)) as i64
+                        if self.model == ChipModel::FxAidXl {
+                            let v = math::floor(math::exp2(x) * f64::from(ONE_S23)) as i64;
+                            let bits = 64 - (v.max(1) as u64).leading_zeros() as i64;
+                            let sh = (bits - 12).max(0);
+                            (v >> sh) << sh
+                        } else {
+                            math::round(math::exp2(x) * f64::from(ONE_S23)) as i64
+                        }
                     };
                     self.acc = sat24(mul_s1_14(e, i64::from(c)) + (i64::from(d) << 13));
                 }
@@ -471,7 +622,10 @@ impl Fv1 {
     fn delay_write(&mut self, offset: i32, value: i32) {
         let idx = (self.cursor.wrapping_add(offset) & DELAY_MASK) as usize;
         self.delay[idx] = if self.quantize_delay_14bit {
-            compress14(value)
+            match self.model {
+                ChipModel::Reference => compress14(value),
+                ChipModel::FxAidXl => compress14_xl(value),
+            }
         } else {
             value
         };
@@ -492,6 +646,17 @@ fn compress14(v: i32) -> i32 {
     let shift = (bits - 10).clamp(6, 13) as u32;
     let q = ((mag >> shift) << shift) as i32;
     if v < 0 { -q } else { q }
+}
+
+/// The chip's 14-bit floating-point delay-RAM word as measured on the FX AID XL (2026-10-09,
+/// 1,440/1,440 values bit-exact): sign, 4-bit exponent, 9-bit fraction. A value keeps its top
+/// 10 significant bits; below 2^-14 it is stored exactly (the step there is 2^-23, as for
+/// denormals). The low bits are dropped from the two's-complement value, so the result is
+/// always rounded down (towards minus infinity). [`compress14`] matched 13 of the 1,440.
+fn compress14_xl(v: i32) -> i32 {
+    let bits = 32 - v.unsigned_abs().leading_zeros() as i32;
+    let shift = (bits - 10).max(0) as u32;
+    (v >> shift) << shift
 }
 
 impl Default for Fv1 {

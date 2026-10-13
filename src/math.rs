@@ -29,6 +29,12 @@ pub(crate) fn round(x: f64) -> f64 {
     }
 }
 
+/// Round towards minus infinity (no_std).
+pub(crate) fn floor(x: f64) -> f64 {
+    let t = x as i64 as f64; // trunc toward zero, exact in our range
+    if t > x { t - 1.0 } else { t }
+}
+
 const LN_2: f64 = core::f64::consts::LN_2;
 const SQRT_2: f64 = core::f64::consts::SQRT_2;
 

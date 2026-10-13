@@ -25,6 +25,7 @@ pub const ACC_MAX: i32 = ONE_S23 - 1;
 pub const ACC_MIN: i32 = -ONE_S23;
 
 /// Saturate a wide intermediate result to the 24-bit accumulator range.
+#[cfg(not(feature = "satcount"))]
 #[inline]
 #[must_use]
 pub const fn sat24(v: i64) -> i32 {
@@ -34,6 +35,44 @@ pub const fn sat24(v: i64) -> i32 {
         ACC_MIN
     } else {
         v as i32
+    }
+}
+
+/// Saturate as above, counting each clamp against the instruction that caused
+/// it (`satcount::PC`; index 128 is the ADC input). A diagnostic build only:
+/// the arithmetic is identical.
+#[cfg(feature = "satcount")]
+#[inline]
+#[must_use]
+pub fn sat24(v: i64) -> i32 {
+    if v > ACC_MAX as i64 {
+        satcount::hit();
+        ACC_MAX
+    } else if v < ACC_MIN as i64 {
+        satcount::hit();
+        ACC_MIN
+    } else {
+        v as i32
+    }
+}
+
+/// Accumulator-saturation counts per instruction (the `satcount` feature, a diagnostic).
+#[cfg(feature = "satcount")]
+pub mod satcount {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    /// Instruction being executed (128 while converting the ADC input).
+    pub static PC: AtomicUsize = AtomicUsize::new(0);
+    /// Saturations so far, indexed by instruction (128: the ADC input).
+    pub static COUNTS: [AtomicU64; 129] = [const { AtomicU64::new(0) }; 129];
+    /// Count one saturation against the current instruction.
+    #[inline]
+    pub fn hit() {
+        COUNTS[PC.load(Ordering::Relaxed)].fetch_add(1, Ordering::Relaxed);
+    }
+    /// Set the instruction being executed.
+    #[inline]
+    pub fn set_pc(pc: usize) {
+        PC.store(pc, Ordering::Relaxed);
     }
 }
 

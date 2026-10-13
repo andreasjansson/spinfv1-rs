@@ -108,4 +108,4 @@ pub use asm::{AsmError, assemble};
 pub use fixed::coeff;
 pub use instruction::{ChoFlags, Instruction, LfoSel, RampAmp, SkpCond, reg};
 pub use program::{NOP_WORD, PROGRAM_LEN, Program, ProgramError};
-pub use vm::{DELAY_LEN, Fv1, SAMPLE_RATE};
+pub use vm::{ChipModel, DELAY_LEN, Fv1, SAMPLE_RATE, XL_POT_SMOOTHING};
