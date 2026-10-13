@@ -1,0 +1,20 @@
+[package]
+name = "spinfv1-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "spinfv1 as a browser WebAssembly module (C ABI, no imports), modelling the FV-1 in the FX AID XL"
+license-file = "../LICENSE"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spinfv1 = { path = "..", features = ["resampler"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

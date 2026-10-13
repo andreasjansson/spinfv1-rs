@@ -42,3 +42,18 @@ jobs:
         run: cargo doc --no-deps --features ffi
         env:
           RUSTDOCFLAGS: -D warnings
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --manifest-path wasm/Cargo.toml --check
+      - name: Clippy
+        run: cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown --release -- -D warnings
+      - name: Build
+        run: wasm/build.sh

@@ -7,6 +7,60 @@ coverage including audio end-to-end tests. A pure library with zero
 dependencies in every configuration (`no_std` included) and a
 one-sample-per-call API, ready to embed in any real-time host.
 
+## This fork: the FV-1 in the FX AID XL
+
+This is a fork of [ngriaznov/spinfv1-rs](https://github.com/ngriaznov/spinfv1-rs). It adds
+an opt-in model of the FV-1 inside the Happy Nerding FX AID XL Eurorack module, and a
+browser WebAssembly build. It was made for
+[Otherworld vol. 1](https://github.com/andreasjansson/otherworld), a bank of custom effects
+for that module, whose listening page runs this emulator in the browser. Without the
+opt-in, the emulator behaves exactly as upstream, and upstream's whole test suite still
+passes unchanged.
+
+`Fv1::fx_aid_xl()` (or `Fv1::new()` followed by `set_model(ChipModel::FxAidXl)` and
+the setters below) models what we measured on a module. Probe programs ran on the
+chip, the module's codec recorded them, and they were compared frame by frame with the
+emulator (2026-10-09):
+
+| | Reference model (upstream, the default) | `ChipModel::FxAidXl` |
+|---|---|---|
+| `MULX` | register at full precision | register truncated to 14 fractional bits, product floored (240/240 frames bit-exact) |
+| `LOG` | log2 rounded at S4.19 | log2 floored to a 2^-12 grid (within ~3 grid steps of the chip; its exact curve is not known) |
+| `EXP` | 2^x rounded at S.23 | about 12 significant bits, rounded down (124/240 bit-exact, rms error 2.4e-4) |
+| delay RAM word | sign, 3-bit exponent, 10-bit mantissa, step ≥ 2^6, magnitude truncated | sign, 4-bit exponent, 9-bit fraction: top 10 significant bits, exact below 2^-14, rounded towards minus infinity (1,440/1,440 values bit-exact) |
+| reads of `SIN*/RMP*` rate and range, `DACL`/`DACR`, `ADDR_PTR` | the written value | 0 (`set_lfo_reads_zero`) |
+| pots | follow `set_pot` at once | one-pole lag of about 123 ms, as the module's knob and CV inputs (`set_pot_smoothing`, `XL_POT_SMOOTHING`); the first setting applies at once |
+
+Also new:
+
+- `resampler::XL_CHIP_RATE` (32,774 Hz): the module's FV-1 clock in its fixed-rate CV
+  modes. Run the chip at it with `HostedFv1::with_chip_rate(chip, host_rate, XL_CHIP_RATE)`.
+- `Fv1::switch_program_keep_state`: a slot change as the module does it. REG0-31 and delay
+  RAM start at 0, the `SKP RUN` block runs again, and the LFOs keep running.
+- `Fv1::scramble_registers`: fills REG0-31 with full-scale noise, to test that a program
+  doesn't depend on starting from zero.
+- The `satcount` feature, a diagnostic build that counts accumulator saturations per
+  instruction (`fixed::satcount`).
+- `wasm/`: the browser build. `wasm/build.sh` writes `wasm/dist/fv1.wasm`, a module with no
+  imports and a small C ABI:
+  - `fv1_new(rate)` makes an engine. It is an `Fv1::fx_aid_xl()` behind the resampler, at
+    `XL_CHIP_RATE`, for an AudioContext running at `rate`.
+  - To load a program, write SpinASM source into the buffer from `fv1_scratch(e, len)`, then
+    call `fv1_assemble(e)`. A nonzero result is the length of the error text at
+    `fv1_error_ptr(e)`.
+  - `fv1_set_pot(e, i, v)` sets a pot.
+  - To process audio, fill the planar buffer at `fv1_in_ptr(e)` (left at `[0, B)`, right at
+    `[B, 2B)`, with `B = fv1_block()`), call `fv1_process(e, frames)`, and read the result at
+    `fv1_out_ptr(e)`.
+  - Refresh your typed-array views after `fv1_scratch` and `fv1_assemble`: they can grow the
+    memory.
+
+  Otherworld's [AudioWorklet](https://github.com/andreasjansson/otherworld/blob/main/site/fv1-worklet.js)
+  is a complete example.
+
+All of this is licensed under the spinfv1 Source-Available License, as upstream (see
+[License](#license)).
+
 ## What's emulated
 
 - **All instructions**: `RDA` `RMPA` `WRA` `WRAP` `RDAX` `RDFX` `WRAX` `WRHX`
